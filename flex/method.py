@@ -3,11 +3,17 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from .frequency import FrequencyPrompt, apply_frequency_prompt
+
+try:
+    from scipy import ndimage
+except Exception:  # pragma: no cover
+    ndimage = None
 
 
 @dataclass
@@ -15,96 +21,145 @@ class FlexConfig:
     benign_index: int = 0
     malignant_index: int = 1
     normal_index: int = 2
-    lesion_topk_ratio: float = 0.01
+    kappa: float = 1.0
+    eta_min: float = 0.50
+    eta_max: float = 0.95
+    delta: float = 0.05
     frequency_weights: tuple[float, float, float] = (0.25, 0.50, 0.25)
     rho_seg: float = 0.50
     rho_cls: float = 0.50
     lr: float = 1e-4
     steps: int = 1
-    lambda_sub: float = 0.10
     lambda_src: float = 0.10
     lambda_pres: float = 0.50
     lambda_neg: float = 0.50
-    lambda_prompt: float = 1e-3
-    source_fg_threshold: float = 0.50
-    source_bg_threshold: float = 0.10
+    beta_area: float = 1.0
+    mask_threshold: float = 0.40
+    class_prior: tuple[float, float, float] | None = None
+    class_prior_strength: float = 1.0
+    morphology_refinement: bool = True
+    min_component_area_ratio: float = 5e-4
 
 
-def binary_kl(student_logits: torch.Tensor, teacher_logits: torch.Tensor) -> torch.Tensor:
-    student = torch.sigmoid(student_logits).clamp(1e-6, 1 - 1e-6)
-    teacher = torch.sigmoid(teacher_logits).clamp(1e-6, 1 - 1e-6)
-    return teacher * (teacher.log() - student.log()) + (1 - teacher) * (
-        (1 - teacher).log() - (1 - student).log()
-    )
+def adaptive_threshold(prob: torch.Tensor, cfg: FlexConfig) -> torch.Tensor:
+    flat = prob.flatten(1)
+    mean = flat.mean(dim=1)
+    std = flat.std(dim=1, unbiased=False)
+    return (mean + cfg.kappa * std).clamp(cfg.eta_min, cfg.eta_max)
 
 
-def lesion_score_from_mask(seg_logits: torch.Tensor, topk_ratio: float = 0.01) -> torch.Tensor:
-    probs = torch.sigmoid(seg_logits).flatten(1)
-    topk = max(1, int(probs.size(1) * topk_ratio))
-    return probs.topk(topk, dim=1).values.mean(1).clamp(0.0, 1.0)
+def lesion_support(prob: torch.Tensor, cfg: FlexConfig) -> tuple[torch.Tensor, torch.Tensor]:
+    eta = adaptive_threshold(prob, cfg)
+    support = prob >= eta.view(-1, 1, 1, 1)
+    return support, eta
+
+
+def lesion_score(prob: torch.Tensor, cfg: FlexConfig) -> torch.Tensor:
+    support, _eta = lesion_support(prob, cfg)
+    flat_prob = prob.flatten(1)
+    flat_support = support.flatten(1)
+    support_count = flat_support.sum(dim=1)
+    support_sum = (flat_prob * flat_support.float()).sum(dim=1)
+    fallback = flat_prob.max(dim=1).values
+    return torch.where(support_count > 0, support_sum / support_count.clamp_min(1.0), fallback).clamp(0.0, 1.0)
 
 
 def lesion_first_probabilities(cls_logits: torch.Tensor, seg_logits: torch.Tensor, cfg: FlexConfig) -> torch.Tensor:
-    """Convert lesion evidence and benign/malignant logits into three-class probabilities."""
+    """Eq. (4): Normal is absence of lesion evidence; Benign/Malignant share lesion mass."""
 
-    lesion_score = lesion_score_from_mask(seg_logits, cfg.lesion_topk_ratio)
+    prob = torch.sigmoid(seg_logits)
+    score = lesion_score(prob, cfg)
     subtype_logits = torch.stack(
         [cls_logits[:, cfg.benign_index], cls_logits[:, cfg.malignant_index]],
         dim=1,
     )
     subtype_probs = subtype_logits.softmax(dim=1)
     probs = torch.zeros_like(cls_logits.softmax(dim=1))
-    probs[:, cfg.normal_index] = 1.0 - lesion_score
-    probs[:, cfg.benign_index] = lesion_score * subtype_probs[:, 0]
-    probs[:, cfg.malignant_index] = lesion_score * subtype_probs[:, 1]
+    probs[:, cfg.normal_index] = 1.0 - score
+    probs[:, cfg.benign_index] = score * subtype_probs[:, 0]
+    probs[:, cfg.malignant_index] = score * subtype_probs[:, 1]
     return probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+
+def class_prior_calibration(probs: torch.Tensor, cfg: FlexConfig) -> torch.Tensor:
+    if cfg.class_prior is None or cfg.class_prior_strength <= 0:
+        return probs
+    prior = probs.new_tensor(cfg.class_prior)
+    prior = prior / prior.sum().clamp_min(1e-8)
+    logits = probs.clamp_min(1e-8).log() + cfg.class_prior_strength * prior.clamp_min(1e-8).log()
+    return logits.softmax(dim=1)
+
+
+def source_supported_weight(source_seg_logits: torch.Tensor, source_cls_logits: torch.Tensor, cfg: FlexConfig) -> torch.Tensor:
+    p0 = torch.sigmoid(source_seg_logits)
+    q0 = source_cls_logits.softmax(dim=1)
+    return (lesion_score(p0, cfg) * torch.maximum(1.0 - q0[:, cfg.normal_index], q0.new_full(q0[:, 0].shape, cfg.delta))).detach()
 
 
 def flex_objective(
     adapted_seg_logits: torch.Tensor,
     adapted_cls_logits: torch.Tensor,
     source_seg_logits: torch.Tensor,
-    prompt: FrequencyPrompt,
+    source_cls_logits: torch.Tensor,
     cfg: FlexConfig,
 ) -> torch.Tensor:
-    """Unsupervised FLeX objective used during test-time prompt adaptation."""
+    """Eq. (15)-(20): constrained lesion-aware prompt objective."""
 
+    pt = torch.sigmoid(adapted_seg_logits)
+    p0 = torch.sigmoid(source_seg_logits).detach()
+    alpha0 = source_supported_weight(source_seg_logits, source_cls_logits, cfg)
     subtype_logits = torch.stack(
         [adapted_cls_logits[:, cfg.benign_index], adapted_cls_logits[:, cfg.malignant_index]],
         dim=1,
     )
     subtype_probs = subtype_logits.softmax(dim=1)
-    loss_sub = -(subtype_probs * subtype_probs.clamp_min(1e-8).log()).sum(1).mean()
+    subtype_entropy = -(subtype_probs * subtype_probs.clamp_min(1e-8).log()).sum(dim=1)
+    loss_sub = (alpha0 * subtype_entropy).mean()
 
-    pred_prob = torch.sigmoid(adapted_seg_logits)
-    src_prob = torch.sigmoid(source_seg_logits).detach()
-    loss_src = binary_kl(adapted_seg_logits, source_seg_logits.detach()).mean()
+    loss_src_map = (pt - p0).abs().flatten(1).mean(dim=1)
+    area_t = pt.flatten(1).mean(dim=1)
+    area_0 = p0.flatten(1).mean(dim=1)
+    loss_src = (loss_src_map + cfg.beta_area * (area_t - area_0).abs()).mean()
 
-    src_fg = (src_prob > cfg.source_fg_threshold).float()
-    fg_denom = src_fg.sum(dim=(1, 2, 3), keepdim=True).clamp_min(1.0)
-    loss_pres = (F.relu(src_prob - pred_prob).square() * src_fg).sum(dim=(1, 2, 3), keepdim=True)
-    loss_pres = (loss_pres / fg_denom).mean()
+    support0, eta0 = lesion_support(p0, cfg)
+    background0 = p0 < eta0.view(-1, 1, 1, 1)
+    support_count = support0.flatten(1).sum(dim=1).clamp_min(1.0)
+    background_count = background0.flatten(1).sum(dim=1).clamp_min(1.0)
 
-    src_bg = (src_prob < cfg.source_bg_threshold).float()
-    bg_denom = src_bg.sum(dim=(1, 2, 3), keepdim=True).clamp_min(1.0)
-    loss_neg = (pred_prob.square() * src_bg).sum(dim=(1, 2, 3), keepdim=True)
-    loss_neg = (loss_neg / bg_denom).mean()
+    loss_pres = (F.relu(p0 - pt) * support0.float()).flatten(1).sum(dim=1)
+    loss_pres = (alpha0 * loss_pres / support_count).mean()
+    loss_neg = (F.relu(pt - eta0.view(-1, 1, 1, 1)) * background0.float()).flatten(1).sum(dim=1)
+    loss_neg = (loss_neg / background_count).mean()
+    return loss_sub + cfg.lambda_src * loss_src + cfg.lambda_pres * loss_pres + cfg.lambda_neg * loss_neg
 
-    prompt_reg = sum(param.square().mean() for param in prompt.parameters())
-    return (
-        cfg.lambda_sub * loss_sub
-        + cfg.lambda_src * loss_src
-        + cfg.lambda_pres * loss_pres
-        + cfg.lambda_neg * loss_neg
-        + cfg.lambda_prompt * prompt_reg
-    )
+
+def refine_mask(mask: np.ndarray, cfg: FlexConfig) -> np.ndarray:
+    if not cfg.morphology_refinement:
+        return mask.astype(bool)
+    mask = mask.astype(bool)
+    if mask.sum() == 0:
+        return mask
+    min_area = max(1, int(mask.size * cfg.min_component_area_ratio))
+    if ndimage is None:
+        return mask if mask.sum() >= min_area else np.zeros_like(mask, dtype=bool)
+    filled = ndimage.binary_fill_holes(mask)
+    labels, num = ndimage.label(filled)
+    if num == 0:
+        return filled
+    areas = np.bincount(labels.ravel())
+    areas[0] = 0
+    keep = int(areas.argmax())
+    if areas[keep] < min_area:
+        return np.zeros_like(mask, dtype=bool)
+    return labels == keep
 
 
 class FlexAdapter:
-    """Model-agnostic FLeX test-time adapter.
+    """FLeX adapter matching the paper method.
 
     The wrapped model must return `(segmentation_logits, classification_logits)`.
-    Backbone weights are frozen; only frequency prompts are updated at test time.
+    Source model weights are frozen; only low/mid/high prompt parameters are
+    updated on unlabeled target images.
     """
 
     def __init__(
@@ -133,14 +188,21 @@ class FlexAdapter:
         self.source_model.eval()
         self.prompt.train()
         optimizer = torch.optim.Adam(self.prompt.parameters(), lr=self.cfg.lr)
-        source_seg_logits, _source_cls_logits = self.source_model(images)
+        with torch.no_grad():
+            source_seg_logits, source_cls_logits = self.source_model(images)
 
         adapted_seg_logits = adapted_cls_logits = None
         for _ in range(self.cfg.steps):
             optimizer.zero_grad(set_to_none=True)
             prompted = apply_frequency_prompt(images, self.prompt, self.cfg.frequency_weights)
             adapted_seg_logits, adapted_cls_logits = self.model(prompted)
-            loss = flex_objective(adapted_seg_logits, adapted_cls_logits, source_seg_logits, self.prompt, self.cfg)
+            loss = flex_objective(
+                adapted_seg_logits,
+                adapted_cls_logits,
+                source_seg_logits,
+                source_cls_logits,
+                self.cfg,
+            )
             loss.backward()
             optimizer.step()
 
@@ -149,6 +211,7 @@ class FlexAdapter:
             adapted_seg_logits, adapted_cls_logits = self.model(prompted)
         return {
             "source_seg_logits": source_seg_logits,
+            "source_cls_logits": source_cls_logits,
             "adapted_seg_logits": adapted_seg_logits,
             "adapted_cls_logits": adapted_cls_logits,
         }
@@ -166,17 +229,17 @@ class FlexAdapter:
             adapted_seg_logits, adapted_cls_logits = source_seg_logits, source_cls_logits
 
         with torch.no_grad():
-            source_cls_probs = lesion_first_probabilities(source_cls_logits, source_seg_logits, self.cfg)
-            adapted_cls_probs = lesion_first_probabilities(adapted_cls_logits, adapted_seg_logits, self.cfg)
-            source_seg_probs = torch.sigmoid(source_seg_logits)
-            adapted_seg_probs = torch.sigmoid(adapted_seg_logits)
-            seg_probs = source_seg_probs + self.cfg.rho_seg * (adapted_seg_probs - source_seg_probs)
-            cls_probs = source_cls_probs + self.cfg.rho_cls * (adapted_cls_probs - source_cls_probs)
-            cls_probs = cls_probs.clamp_min(1e-8)
+            p0 = torch.sigmoid(source_seg_logits)
+            pt = torch.sigmoid(adapted_seg_logits)
+            p_final = (1.0 - self.cfg.rho_seg) * p0 + self.cfg.rho_seg * pt
+            p0_cls = lesion_first_probabilities(source_cls_logits, source_seg_logits, self.cfg)
+            pt_cls = lesion_first_probabilities(adapted_cls_logits, adapted_seg_logits, self.cfg)
+            cls_probs = (1.0 - self.cfg.rho_cls) * p0_cls + self.cfg.rho_cls * pt_cls
             cls_probs = cls_probs / cls_probs.sum(dim=1, keepdim=True).clamp_min(1e-6)
+            cls_probs = class_prior_calibration(cls_probs, self.cfg)
         return {
-            "seg_probs": seg_probs,
+            "seg_probs": p_final,
             "cls_probs": cls_probs,
-            "source_seg_probs": source_seg_probs,
-            "adapted_seg_probs": adapted_seg_probs,
+            "source_seg_probs": p0,
+            "adapted_seg_probs": pt,
         }

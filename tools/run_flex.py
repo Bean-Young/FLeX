@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from flex.data import UltrasoundCsvDataset
-from flex.method import FlexAdapter, FlexConfig
+from flex.method import FlexAdapter, FlexConfig, refine_mask
 from flex.metrics import macro_f1, segmentation_metrics
 
 
@@ -29,7 +29,7 @@ def load_model(factory_spec: str, checkpoint: Path, image_size: int, device: tor
     return model.to(device)
 
 
-def evaluate(adapter: FlexAdapter, loader: DataLoader, device: torch.device, threshold: float, adapt: bool):
+def evaluate(adapter: FlexAdapter, loader: DataLoader, device: torch.device, adapt: bool):
     ious, dices, hd95s = [], [], []
     y_true, y_pred = [], []
     records = []
@@ -41,9 +41,10 @@ def evaluate(adapter: FlexAdapter, loader: DataLoader, device: torch.device, thr
         masks_np = masks.numpy()
         labels_np = labels.numpy()
         preds = cls_probs.argmax(axis=1)
-        pred_masks = seg_probs > threshold
+        pred_masks = seg_probs > adapter.cfg.mask_threshold
         for idx, path in enumerate(paths):
-            metrics = segmentation_metrics(pred_masks[idx, 0], masks_np[idx, 0] > 0.5)
+            pred_mask = refine_mask(pred_masks[idx, 0], adapter.cfg)
+            metrics = segmentation_metrics(pred_mask, masks_np[idx, 0] > 0.5)
             ious.append(metrics["iou"])
             dices.append(metrics["dice"])
             if metrics["hd95"] is not None:
@@ -79,7 +80,9 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--threshold", type=float, default=0.40)
+    parser.add_argument("--class-prior", default=None, help="Optional comma-separated Benign,Malignant,Normal prior.")
+    parser.add_argument("--disable-morphology", action="store_true")
     parser.add_argument("--no-adapt", action="store_true")
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
@@ -87,9 +90,19 @@ def main() -> None:
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     dataset = UltrasoundCsvDataset(args.manifest, root=args.root, image_size=args.image_size)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    prior = None
+    if args.class_prior:
+        prior = tuple(float(item) for item in args.class_prior.split(","))
+        if len(prior) != 3:
+            raise ValueError("--class-prior must contain three comma-separated values")
+    cfg = FlexConfig(
+        mask_threshold=args.threshold,
+        class_prior=prior,
+        morphology_refinement=not args.disable_morphology,
+    )
     model = load_model(args.model_factory, Path(args.checkpoint), args.image_size, device)
-    adapter = FlexAdapter(model, image_size=args.image_size, cfg=FlexConfig()).to(device)
-    result = evaluate(adapter, loader, device, args.threshold, adapt=not args.no_adapt)
+    adapter = FlexAdapter(model, image_size=args.image_size, cfg=cfg).to(device)
+    result = evaluate(adapter, loader, device, adapt=not args.no_adapt)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w") as f:

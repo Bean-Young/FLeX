@@ -1,6 +1,6 @@
 image_size: 224
 batch_size: 8
-threshold: 0.5
+threshold: 0.40
 
 classes:
   benign: 0
@@ -12,6 +12,12 @@ frequency_weights:
   mid: 0.50
   high: 0.25
 
+lesion_support:
+  kappa: 1.0
+  eta_min: 0.50
+  eta_max: 0.95
+  delta: 0.05
+
 adaptation:
   steps: 1
   lr: 0.0001
@@ -19,8 +25,13 @@ adaptation:
   rho_cls: 0.50
 
 loss:
-  lambda_sub: 0.10
   lambda_src: 0.10
   lambda_pres: 0.50
   lambda_neg: 0.50
-  lambda_prompt: 0.001
+  beta_area: 1.0
+
+output_safeguards:
+  class_prior: null
+  class_prior_strength: 1.0
+  morphology_refinement: true
+  min_component_area_ratio: 0.0005
