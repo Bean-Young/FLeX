@@ -1,0 +1,26 @@
+image_size: 224
+batch_size: 8
+threshold: 0.5
+
+classes:
+  benign: 0
+  malignant: 1
+  normal: 2
+
+frequency_weights:
+  low: 0.25
+  mid: 0.50
+  high: 0.25
+
+adaptation:
+  steps: 1
+  lr: 0.0001
+  rho_seg: 0.50
+  rho_cls: 0.50
+
+loss:
+  lambda_sub: 0.10
+  lambda_src: 0.10
+  lambda_pres: 0.50
+  lambda_neg: 0.50
+  lambda_prompt: 0.001

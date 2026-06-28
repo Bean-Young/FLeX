@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flex-tta"
+version = "0.1.0"
+description = "Lesion-first frequency-aware test-time adaptation for breast ultrasound."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.23",
+  "Pillow>=9.0",
+  "torch>=2.0",
+  "torchvision>=0.15",
+  "tqdm>=4.64",
+]
+
+[tool.setuptools.packages.find]
+include = ["flex*"]
