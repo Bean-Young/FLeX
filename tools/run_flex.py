@@ -81,6 +81,17 @@ def main() -> None:
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--threshold", type=float, default=0.40)
+    parser.add_argument("--low-radius", type=float, default=2.0, help="Low/mid boundary in Fourier-grid pixels at the selected image size.")
+    parser.add_argument("--mid-radius", type=float, default=8.0, help="Mid/high boundary in Fourier-grid pixels at the selected image size.")
+    parser.add_argument("--frequency-weights", default="0.25,0.50,0.25", help="Comma-separated low,mid,high fusion weights.")
+    parser.add_argument("--prompt-mode", choices=("bands", "full"), default="bands", help="Use three frequency bands or the full-band ablation.")
+    parser.add_argument("--steps", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--rho-seg", type=float, default=0.50)
+    parser.add_argument("--rho-cls", type=float, default=0.50)
+    parser.add_argument("--lambda-src", type=float, default=0.10)
+    parser.add_argument("--lambda-pres", type=float, default=0.50)
+    parser.add_argument("--lambda-neg", type=float, default=0.50)
     parser.add_argument("--class-prior", default=None, help="Optional comma-separated Benign,Malignant,Normal prior.")
     parser.add_argument("--disable-morphology", action="store_true")
     parser.add_argument("--no-adapt", action="store_true")
@@ -95,8 +106,22 @@ def main() -> None:
         prior = tuple(float(item) for item in args.class_prior.split(","))
         if len(prior) != 3:
             raise ValueError("--class-prior must contain three comma-separated values")
+    frequency_weights = tuple(float(item) for item in args.frequency_weights.split(","))
+    if len(frequency_weights) != 3:
+        raise ValueError("--frequency-weights must contain low,mid,high values")
     cfg = FlexConfig(
         mask_threshold=args.threshold,
+        frequency_alpha_low=args.low_radius / args.image_size,
+        frequency_alpha_mid=args.mid_radius / args.image_size,
+        frequency_weights=frequency_weights,
+        prompt_mode=args.prompt_mode,
+        steps=args.steps,
+        lr=args.lr,
+        rho_seg=args.rho_seg,
+        rho_cls=args.rho_cls,
+        lambda_src=args.lambda_src,
+        lambda_pres=args.lambda_pres,
+        lambda_neg=args.lambda_neg,
         class_prior=prior,
         morphology_refinement=not args.disable_morphology,
     )

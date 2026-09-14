@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .frequency import FrequencyPrompt, apply_frequency_prompt
+from .frequency import FrequencyBands, FrequencyPrompt, apply_frequency_prompt
 
 try:
     from scipy import ndimage
@@ -26,6 +26,9 @@ class FlexConfig:
     eta_max: float = 0.95
     delta: float = 0.05
     frequency_weights: tuple[float, float, float] = (0.25, 0.50, 0.25)
+    frequency_alpha_low: float = 2.0 / 224.0
+    frequency_alpha_mid: float = 8.0 / 224.0
+    prompt_mode: str = "bands"
     rho_seg: float = 0.50
     rho_cls: float = 0.50
     lr: float = 1e-4
@@ -170,8 +173,14 @@ class FlexAdapter:
     ) -> None:
         self.model = model
         self.source_model = copy.deepcopy(model).eval()
-        self.prompt = FrequencyPrompt(image_size=image_size)
         self.cfg = cfg or FlexConfig()
+        self.prompt = FrequencyPrompt(
+            image_size=image_size,
+            bands=FrequencyBands(
+                alpha_low=self.cfg.frequency_alpha_low,
+                alpha_mid=self.cfg.frequency_alpha_mid,
+            ),
+        )
         for param in self.model.parameters():
             param.requires_grad_(False)
         for param in self.source_model.parameters():
@@ -194,7 +203,9 @@ class FlexAdapter:
         adapted_seg_logits = adapted_cls_logits = None
         for _ in range(self.cfg.steps):
             optimizer.zero_grad(set_to_none=True)
-            prompted = apply_frequency_prompt(images, self.prompt, self.cfg.frequency_weights)
+            prompted = apply_frequency_prompt(
+                images, self.prompt, self.cfg.frequency_weights, self.cfg.prompt_mode
+            )
             adapted_seg_logits, adapted_cls_logits = self.model(prompted)
             loss = flex_objective(
                 adapted_seg_logits,
@@ -207,7 +218,9 @@ class FlexAdapter:
             optimizer.step()
 
         if adapted_seg_logits is None or adapted_cls_logits is None:
-            prompted = apply_frequency_prompt(images, self.prompt, self.cfg.frequency_weights)
+            prompted = apply_frequency_prompt(
+                images, self.prompt, self.cfg.frequency_weights, self.cfg.prompt_mode
+            )
             adapted_seg_logits, adapted_cls_logits = self.model(prompted)
         return {
             "source_seg_logits": source_seg_logits,

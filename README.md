@@ -83,8 +83,12 @@ phi_lesion(x) =
 The main configuration uses:
 
 ```text
+alpha_1 = 2 / 224, alpha_2 = 8 / 224
 omega_low = 0.25, omega_mid = 0.50, omega_high = 0.25
 ```
+
+For 224 x 224 inputs, the corresponding radial bands are `r < 2`,
+`2 <= r < 8`, and `r >= 8` Fourier-grid pixels.
 
 The mid-frequency component is emphasized because it captures lesion-background transition and boundary morphology, while low and high frequencies preserve coarse tissue context and fine texture.
 
@@ -222,6 +226,14 @@ python tools/run_flex.py \
   --output results/source_noadapt.json \
   --no-adapt
 ```
+
+The reported prompt-design ablations use BrEaST as the source, UNet as the
+backbone, BUS-UCLM and BUSI as direct TTA targets, and the ordered
+BUSBRA-D1 to BUSBRA-D4 stream for CTTA. They can be selected with
+`--prompt-mode full` or with `--frequency-weights 1,0,0`, `0,1,0`, `0,0,1`,
+`0.333333,0.333333,0.333333`, and `0.25,0.50,0.25`. Loss-term ablations set
+the corresponding `--lambda-src`, `--lambda-pres`, or `--lambda-neg` value
+to zero. Source-preserving fusion can be removed with `--rho-seg 1 --rho-cls 1`.
 
 ## Repository layout
 

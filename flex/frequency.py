@@ -9,8 +9,9 @@ from torch.nn import functional as F
 
 @dataclass(frozen=True)
 class FrequencyBands:
-    alpha_low: float = 0.005
-    alpha_mid: float = 0.010
+    # Paper setting for 224 x 224 inputs: r < 2, 2 <= r < 8, r >= 8.
+    alpha_low: float = 2.0 / 224.0
+    alpha_mid: float = 8.0 / 224.0
 
 
 class FrequencyPrompt(nn.Module):
@@ -38,8 +39,8 @@ class FrequencyPrompt(nn.Module):
 
     def masks(self, height: int, width: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         min_dim = min(height, width)
-        low_radius = max(1, int(min_dim * self.bands.alpha_low))
-        mid_radius = max(low_radius + 1, int(min_dim * self.bands.alpha_mid))
+        low_radius = max(1, round(min_dim * self.bands.alpha_low))
+        mid_radius = max(low_radius + 1, round(min_dim * self.bands.alpha_mid))
         center_h, center_w = height // 2, width // 2
         yy, xx = torch.meshgrid(
             torch.arange(height, device=device),
@@ -80,10 +81,17 @@ def apply_frequency_prompt(
     images: torch.Tensor,
     prompt: FrequencyPrompt,
     weights: torch.Tensor | tuple[float, float, float] | None = None,
+    mode: str = "bands",
 ) -> torch.Tensor:
     """Build the lesion-frequency representation in Eq. (11)."""
 
     batch, _channels, height, width = images.shape
+    if mode == "full":
+        # Full-band ablation: one prompt acts on the undecomposed image.
+        residual = _resize(prompt.low, height, width)
+        return images + prompt.xi * torch.tanh(residual)
+    if mode != "bands":
+        raise ValueError(f"Unknown prompt mode: {mode!r}")
     if weights is None:
         weights = images.new_tensor((0.25, 0.50, 0.25)).view(1, 3).repeat(batch, 1)
     elif not torch.is_tensor(weights):
