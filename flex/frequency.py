@@ -18,7 +18,8 @@ class FrequencyPrompt(nn.Module):
     """Frequency-aware lesion prompts from the FLeX paper.
 
     The image is decomposed into low, mid, and high Fourier bands. Each band is
-    mapped back to image space and receives a bounded additive prompt residual.
+    mapped back to image space and receives a bounded residual whose Fourier
+    support is restricted to the same band.
     """
 
     def __init__(
@@ -58,6 +59,22 @@ def _resize(param: torch.Tensor, height: int, width: int) -> torch.Tensor:
     if param.shape[-2:] == (height, width):
         return param
     return F.interpolate(param, size=(height, width), mode="bilinear", align_corners=False)
+
+
+def _band_limited_residual(
+    param: torch.Tensor,
+    mask: torch.Tensor,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    """Apply the band mask after tanh so the learned residual stays in-band."""
+
+    spatial = torch.tanh(_resize(param, height, width))
+    spectrum = torch.fft.fftshift(torch.fft.fft2(spatial, dim=(-2, -1)), dim=(-2, -1))
+    masked = spectrum * mask.view(1, 1, height, width)
+    return torch.fft.ifft2(
+        torch.fft.ifftshift(masked, dim=(-2, -1)), dim=(-2, -1)
+    ).real
 
 
 def decompose_frequency_bands(
@@ -101,6 +118,7 @@ def apply_frequency_prompt(
         if weights.ndim == 1:
             weights = weights.view(1, 3).repeat(batch, 1)
 
+    masks = prompt.masks(height, width, images.device)
     bands = decompose_frequency_bands(images, prompt)
     params = (
         _resize(prompt.low, height, width),
@@ -108,7 +126,8 @@ def apply_frequency_prompt(
         _resize(prompt.high, height, width),
     )
     output = torch.zeros_like(images)
-    for band_idx, (band, param) in enumerate(zip(bands, params)):
-        prompted = band + prompt.xi * torch.tanh(param)
+    for band_idx, (band, param, mask) in enumerate(zip(bands, params, masks)):
+        residual = _band_limited_residual(param, mask, height, width)
+        prompted = band + prompt.xi * residual
         output = output + weights[:, band_idx].view(batch, 1, 1, 1) * prompted
     return output

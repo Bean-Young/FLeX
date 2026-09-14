@@ -28,9 +28,11 @@ class FlexConfig:
     frequency_weights: tuple[float, float, float] = (0.25, 0.50, 0.25)
     frequency_alpha_low: float = 2.0 / 224.0
     frequency_alpha_mid: float = 8.0 / 224.0
+    prompt_amplitude: float = 0.05
     prompt_mode: str = "bands"
     rho_seg: float = 0.50
     rho_cls: float = 0.50
+    reliability_fusion: bool = True
     lr: float = 1e-4
     steps: int = 1
     lambda_src: float = 0.10
@@ -176,11 +178,13 @@ class FlexAdapter:
         self.cfg = cfg or FlexConfig()
         self.prompt = FrequencyPrompt(
             image_size=image_size,
+            xi=self.cfg.prompt_amplitude,
             bands=FrequencyBands(
                 alpha_low=self.cfg.frequency_alpha_low,
                 alpha_mid=self.cfg.frequency_alpha_mid,
             ),
         )
+        self.optimizer = torch.optim.Adam(self.prompt.parameters(), lr=self.cfg.lr)
         for param in self.model.parameters():
             param.requires_grad_(False)
         for param in self.source_model.parameters():
@@ -196,13 +200,12 @@ class FlexAdapter:
         self.model.eval()
         self.source_model.eval()
         self.prompt.train()
-        optimizer = torch.optim.Adam(self.prompt.parameters(), lr=self.cfg.lr)
         with torch.no_grad():
             source_seg_logits, source_cls_logits = self.source_model(images)
 
         adapted_seg_logits = adapted_cls_logits = None
         for _ in range(self.cfg.steps):
-            optimizer.zero_grad(set_to_none=True)
+            self.optimizer.zero_grad(set_to_none=True)
             prompted = apply_frequency_prompt(
                 images, self.prompt, self.cfg.frequency_weights, self.cfg.prompt_mode
             )
@@ -215,9 +218,11 @@ class FlexAdapter:
                 self.cfg,
             )
             loss.backward()
-            optimizer.step()
+            self.optimizer.step()
 
-        if adapted_seg_logits is None or adapted_cls_logits is None:
+        # Predict again after the final update so the returned output uses the
+        # prompt fitted to the current batch.
+        with torch.no_grad():
             prompted = apply_frequency_prompt(
                 images, self.prompt, self.cfg.frequency_weights, self.cfg.prompt_mode
             )
@@ -228,6 +233,14 @@ class FlexAdapter:
             "adapted_seg_logits": adapted_seg_logits,
             "adapted_cls_logits": adapted_cls_logits,
         }
+
+    def reset_adaptation(self) -> None:
+        """Reset prompts and Adam state before an independent TTA transfer."""
+
+        with torch.no_grad():
+            for parameter in self.prompt.parameters():
+                parameter.zero_()
+        self.optimizer = torch.optim.Adam(self.prompt.parameters(), lr=self.cfg.lr)
 
     def predict(self, images: torch.Tensor, adapt: bool = True) -> dict[str, torch.Tensor]:
         self.model.eval()
@@ -244,10 +257,19 @@ class FlexAdapter:
         with torch.no_grad():
             p0 = torch.sigmoid(source_seg_logits)
             pt = torch.sigmoid(adapted_seg_logits)
-            p_final = (1.0 - self.cfg.rho_seg) * p0 + self.cfg.rho_seg * pt
+            reliability = source_supported_weight(
+                source_seg_logits, source_cls_logits, self.cfg
+            ).clamp(0.0, 1.0)
             p0_cls = lesion_first_probabilities(source_cls_logits, source_seg_logits, self.cfg)
             pt_cls = lesion_first_probabilities(adapted_cls_logits, adapted_seg_logits, self.cfg)
-            cls_probs = (1.0 - self.cfg.rho_cls) * p0_cls + self.cfg.rho_cls * pt_cls
+            if self.cfg.reliability_fusion:
+                seg_gate = (self.cfg.rho_seg * reliability).view(-1, 1, 1, 1)
+                cls_gate = (self.cfg.rho_cls * reliability).view(-1, 1)
+                p_final = (1.0 - seg_gate) * p0 + seg_gate * pt
+                cls_probs = (1.0 - cls_gate) * p0_cls + cls_gate * pt_cls
+            else:
+                p_final = pt
+                cls_probs = pt_cls
             cls_probs = cls_probs / cls_probs.sum(dim=1, keepdim=True).clamp_min(1e-6)
             cls_probs = class_prior_calibration(cls_probs, self.cfg)
         return {
@@ -255,4 +277,5 @@ class FlexAdapter:
             "cls_probs": cls_probs,
             "source_seg_probs": p0,
             "adapted_seg_probs": pt,
+            "reliability": reliability,
         }

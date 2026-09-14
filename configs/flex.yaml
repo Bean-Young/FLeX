@@ -17,6 +17,8 @@ frequency_weights:
   mid: 0.50
   high: 0.25
 
+prompt_amplitude: 0.05
+
 lesion_support:
   kappa: 1.0
   eta_min: 0.50
@@ -28,6 +30,7 @@ adaptation:
   lr: 0.0001
   rho_seg: 0.50
   rho_cls: 0.50
+  reliability_fusion: true
 
 loss:
   lambda_src: 0.10

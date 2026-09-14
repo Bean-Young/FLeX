@@ -17,14 +17,31 @@ def segmentation_metrics(pred_mask: np.ndarray, true_mask: np.ndarray) -> dict[s
     true_sum = true.sum()
     iou = 1.0 if union == 0 else float(intersection / union)
     dice = 1.0 if pred_sum + true_sum == 0 else float(2 * intersection / (pred_sum + true_sum))
-    hd95 = None
-    if medpy_metric is not None and pred_sum > 0 and true_sum > 0:
+    empty_mismatch = bool((pred_sum == 0) != (true_sum == 0))
+    if pred_sum == 0 and true_sum == 0:
+        hd95 = 0.0
+    elif empty_mismatch:
+        # Penalize a complete miss or false lesion by the image diagonal.
+        hd95 = float(np.hypot(*pred.shape[-2:]))
+    elif medpy_metric is not None:
         hd95 = float(medpy_metric.binary.hd95(pred, true))
-    return {"iou": iou, "dice": dice, "hd95": hd95}
+    else:
+        hd95 = None
+    return {
+        "iou": iou,
+        "dice": dice,
+        "hd95": hd95,
+        "lesion_iou": None if true_sum == 0 else iou,
+        "lesion_dice": None if true_sum == 0 else dice,
+        "empty_mismatch": float(empty_mismatch),
+    }
 
 
-def macro_f1(y_true: list[int], y_pred: list[int]) -> float:
-    labels = sorted(set(y_true) | set(y_pred))
+def macro_f1(
+    y_true: list[int],
+    y_pred: list[int],
+    labels: tuple[int, ...] = (0, 1, 2),
+) -> float:
     scores = []
     true_arr = np.asarray(y_true)
     pred_arr = np.asarray(y_pred)

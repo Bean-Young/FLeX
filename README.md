@@ -4,7 +4,7 @@ Official clean implementation of:
 
 **Frequency-aware Lesion Experts for Test-Time Adaptation in Breast Ultrasound Analysis**
 
-FLeX is a source-free test-time adaptation (TTA) and continual test-time adaptation (CTTA) framework for joint breast ultrasound lesion segmentation and image-level diagnosis. The method treats lesion evidence as the unit of adaptation: it estimates lesion presence from the segmentation map, performs benign/malignant discrimination only within the lesion-present subspace, adapts target appearance with low/mid/high frequency lesion prompts, and forms the final prediction through source-preserving fusion.
+FLeX is a source-free test-time adaptation (TTA) and continual test-time adaptation (CTTA) framework for joint breast ultrasound lesion segmentation and image-level diagnosis. The method treats lesion evidence as the unit of adaptation: it estimates lesion presence from the segmentation map, performs benign/malignant discrimination within the lesion-present subspace, adapts target appearance with low/mid/high frequency lesion prompts, and forms the final prediction through reliability-weighted source-preserving fusion.
 
 ## Method overview
 
@@ -64,11 +64,13 @@ M_mid  = 1[alpha_1 <= nu < alpha_2]
 M_high = 1[nu >= alpha_2]
 ```
 
-Each band is transformed back to image space and receives a bounded additive prompt:
+Each band is transformed back to image space and receives a bounded additive
+prompt whose learned residual is projected back into the same Fourier band:
 
 ```text
 x_b = Re(IFFT(M_b * FFT(x)))
-Prompt(x_b, P_b) = x_b + xi * tanh(P_b)
+R_b = Re(IFFT(M_b * FFT(tanh(P_b))))
+Prompt(x_b, P_b) = x_b + xi * R_b
 ```
 
 The lesion-frequency representation is:
@@ -132,11 +134,12 @@ L_neg  = 1 / (|B_0| + eps) * sum_{u in B_0} [p_{t,u} - eta(p_0)]_+
 
 `S_0 = S(p_0)` is the source-supported lesion region, and `B_0 = {u | p_{0,u} < eta(p_0)}` is the source-supported background region. The support sets are detached during optimization.
 
-After prompt adaptation, FLeX uses source-preserving prediction fusion:
+After prompt adaptation, FLeX uses the detached source-supported weight as a
+sample-specific reliability gate `g_0 = clip(alpha_0, 0, 1)`:
 
 ```text
-p_final = (1 - rho_seg) * p_0 + rho_seg * p_t
-P_final = (1 - rho_cls) * P_0 + rho_cls * P_t
+p_final = (1 - rho_seg * g_0) * p_0 + rho_seg * g_0 * p_t
+P_final = (1 - rho_cls * g_0) * P_0 + rho_cls * g_0 * P_t
 ```
 
 The binary lesion mask and image-level label are:
@@ -156,6 +159,12 @@ The paper also uses two output-level safeguards:
 - **Morphology-constrained mask refinement**, which removes isolated foreground components that are unlikely to represent coherent lesions.
 
 Both safeguards are implemented and configurable in this repository.
+
+The evaluator uses a fixed Benign/Malignant/Normal label set for three-class
+macro F1. All-image IoU and Dice assign one to a correct empty prediction,
+lesion-only IoU and Dice exclude Normal references, and an empty/non-empty mask
+mismatch receives the image diagonal for HD95. The reported JSON also includes
+the empty-mismatch rate.
 
 ## Installation
 
@@ -233,7 +242,7 @@ BUSBRA-D1 to BUSBRA-D4 stream for CTTA. They can be selected with
 `--prompt-mode full` or with `--frequency-weights 1,0,0`, `0,1,0`, `0,0,1`,
 `0.333333,0.333333,0.333333`, and `0.25,0.50,0.25`. Loss-term ablations set
 the corresponding `--lambda-src`, `--lambda-pres`, or `--lambda-neg` value
-to zero. Source-preserving fusion can be removed with `--rho-seg 1 --rho-cls 1`.
+to zero. Source-preserving fusion can be removed with `--disable-source-fusion`.
 
 ## Repository layout
 

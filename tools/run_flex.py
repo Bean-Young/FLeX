@@ -31,6 +31,7 @@ def load_model(factory_spec: str, checkpoint: Path, image_size: int, device: tor
 
 def evaluate(adapter: FlexAdapter, loader: DataLoader, device: torch.device, adapt: bool):
     ious, dices, hd95s = [], [], []
+    lesion_ious, lesion_dices, empty_mismatches = [], [], []
     y_true, y_pred = [], []
     records = []
     for images, masks, labels, paths in tqdm(loader, desc="eval", ncols=100):
@@ -49,6 +50,10 @@ def evaluate(adapter: FlexAdapter, loader: DataLoader, device: torch.device, ada
             dices.append(metrics["dice"])
             if metrics["hd95"] is not None:
                 hd95s.append(metrics["hd95"])
+            if metrics["lesion_iou"] is not None:
+                lesion_ious.append(metrics["lesion_iou"])
+                lesion_dices.append(metrics["lesion_dice"])
+            empty_mismatches.append(metrics["empty_mismatch"])
             y_true.append(int(labels_np[idx]))
             y_pred.append(int(preds[idx]))
             records.append(
@@ -64,6 +69,9 @@ def evaluate(adapter: FlexAdapter, loader: DataLoader, device: torch.device, ada
         "iou": float(np.mean(ious)) if ious else 0.0,
         "dice": float(np.mean(dices)) if dices else 0.0,
         "hd95": float(np.mean(hd95s)) if hd95s else None,
+        "lesion_iou": float(np.mean(lesion_ious)) if lesion_ious else None,
+        "lesion_dice": float(np.mean(lesion_dices)) if lesion_dices else None,
+        "empty_mismatch_rate": float(np.mean(empty_mismatches)) if empty_mismatches else 0.0,
         "cls_acc": float(np.mean(np.asarray(y_true) == np.asarray(y_pred))) if y_true else 0.0,
         "cls_f1": macro_f1(y_true, y_pred),
         "n": len(y_true),
@@ -83,17 +91,25 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=0.40)
     parser.add_argument("--low-radius", type=float, default=2.0, help="Low/mid boundary in Fourier-grid pixels at the selected image size.")
     parser.add_argument("--mid-radius", type=float, default=8.0, help="Mid/high boundary in Fourier-grid pixels at the selected image size.")
+    parser.add_argument("--prompt-amplitude", type=float, default=0.05)
     parser.add_argument("--frequency-weights", default="0.25,0.50,0.25", help="Comma-separated low,mid,high fusion weights.")
     parser.add_argument("--prompt-mode", choices=("bands", "full"), default="bands", help="Use three frequency bands or the full-band ablation.")
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--rho-seg", type=float, default=0.50)
     parser.add_argument("--rho-cls", type=float, default=0.50)
+    parser.add_argument("--disable-source-fusion", action="store_true")
+    parser.add_argument("--kappa", type=float, default=1.0)
+    parser.add_argument("--eta-min", type=float, default=0.50)
+    parser.add_argument("--eta-max", type=float, default=0.95)
+    parser.add_argument("--delta", type=float, default=0.05)
     parser.add_argument("--lambda-src", type=float, default=0.10)
     parser.add_argument("--lambda-pres", type=float, default=0.50)
     parser.add_argument("--lambda-neg", type=float, default=0.50)
+    parser.add_argument("--beta-area", type=float, default=1.0)
     parser.add_argument("--class-prior", default=None, help="Optional comma-separated Benign,Malignant,Normal prior.")
     parser.add_argument("--disable-morphology", action="store_true")
+    parser.add_argument("--min-component-area-ratio", type=float, default=5e-4)
     parser.add_argument("--no-adapt", action="store_true")
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
@@ -113,17 +129,25 @@ def main() -> None:
         mask_threshold=args.threshold,
         frequency_alpha_low=args.low_radius / args.image_size,
         frequency_alpha_mid=args.mid_radius / args.image_size,
+        prompt_amplitude=args.prompt_amplitude,
         frequency_weights=frequency_weights,
         prompt_mode=args.prompt_mode,
         steps=args.steps,
         lr=args.lr,
         rho_seg=args.rho_seg,
         rho_cls=args.rho_cls,
+        reliability_fusion=not args.disable_source_fusion,
+        kappa=args.kappa,
+        eta_min=args.eta_min,
+        eta_max=args.eta_max,
+        delta=args.delta,
         lambda_src=args.lambda_src,
         lambda_pres=args.lambda_pres,
         lambda_neg=args.lambda_neg,
+        beta_area=args.beta_area,
         class_prior=prior,
         morphology_refinement=not args.disable_morphology,
+        min_component_area_ratio=args.min_component_area_ratio,
     )
     model = load_model(args.model_factory, Path(args.checkpoint), args.image_size, device)
     adapter = FlexAdapter(model, image_size=args.image_size, cfg=cfg).to(device)
