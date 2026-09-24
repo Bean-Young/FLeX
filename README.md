@@ -155,16 +155,21 @@ The paper uses `tau = 0.40`, selected on source validation data and fixed for al
 
 The paper also uses two output-level safeguards:
 
-- **Category prior calibration**, which adjusts diagnostic probabilities using source-validation-selected priors without changing the mask.
+- **Lesion-evidence category prior calibration**, which is the hierarchy in Stage 2 and sets the Normal probability from segmentation evidence.
 - **Morphology-constrained mask refinement**, which removes isolated foreground components that are unlikely to represent coherent lesions.
 
-Both safeguards are implemented and configurable in this repository.
-
-The evaluator uses a fixed Benign/Malignant/Normal label set for three-class
-macro F1. All-image IoU and Dice assign one to a correct empty prediction,
-lesion-only IoU and Dice exclude Normal references, and an empty/non-empty mask
-mismatch receives the image diagonal for HD95. The reported JSON also includes
-the empty-mismatch rate.
+The evaluator uses a fixed Benign/Malignant/Normal label set. `cls_f1` and
+`cls_f1_weighted` are the manuscript's target-support-weighted F1;
+`cls_f1_macro` is the three-class macro F1. The JSON also reports classwise
+precision, recall, F1, support, a three-class confusion matrix, and malignant
+recall. All-image IoU and Dice assign one to a correct empty prediction;
+lesion-only IoU and Dice exclude empty reference masks. The JSON distinguishes
+the all-image empty-mask mismatch rate from the false-positive rate among
+empty reference masks. An empty/non-empty mismatch receives the image diagonal
+for HD95. Scores other than HD95 are stored as fractions, so multiply by 100
+to compare with the manuscript's percentage-point tables. If HD95 cannot be
+computed for every image, its mean is `null` and `hd95_coverage` gives the
+available fraction.
 
 ## Installation
 
@@ -212,19 +217,7 @@ python tools/run_flex.py \
   --threshold 0.40
 ```
 
-Optional category prior calibration:
-
-```bash
-python tools/run_flex.py \
-  --manifest data/target.csv \
-  --root data \
-  --model-factory flex.models:build_unet \
-  --checkpoint checkpoints/source_unet.pth \
-  --output results/flex_target.json \
-  --class-prior 0.40,0.30,0.30
-```
-
-For frozen source-model evaluation without prompt adaptation:
+For the paper's No Adapt baseline, evaluate raw frozen source logits:
 
 ```bash
 python tools/run_flex.py \
@@ -235,6 +228,45 @@ python tools/run_flex.py \
   --output results/source_noadapt.json \
   --no-adapt
 ```
+
+This mode applies the fixed 0.40 mask threshold to the source segmentation
+probability and softmax to the source classification logits. It does not apply
+the FLeX lesion hierarchy, fusion, or morphology refinement.
+For a diagnostic control that applies the hierarchy to the frozen source
+model, replace `--no-adapt` with `--source-hierarchy`.
+
+For the zero-prompt control requested by the frequency ablation, replace
+`--no-adapt` with `--fixed-frequency-only`. This evaluates the fixed
+0.25/0.50/0.25 weighted Fourier-band image with zero prompt residuals and no
+optimizer update, then uses the same source fusion and morphology as FLeX.
+The prompt and optimizer state are unchanged. This distinguishes the fixed
+filter's contribution from learned prompt adaptation.
+
+To recalculate metrics from saved per-image predictions and find historical
+macro-versus-weighted F1 mismatches:
+
+```bash
+python tools/audit_results.py results/flex_target.json --output results/audit.json
+```
+
+To aggregate independent runs, make a CSV with columns
+`setting,method,source,target,backbone,seed,result` and run:
+
+```bash
+python tools/summarize_runs.py results/run_manifest.csv --output results/summary.json
+```
+
+This requires three distinct seeds and four backbones for every transfer by
+default. It recalculates metrics from image records, reports run means and
+sample standard deviations at backbone, target, and source level, then
+averages backbones equally within a target and weights targets by image
+count, as in the manuscript. Use `--expected-backbones 1` for UNet-only
+ablations. Use separate `setting` values for direct TTA and CTTA.
+
+These utilities recalculate new evaluation records; they cannot verify the
+published tables without the original image-level predictions, source model
+checkpoints, and processed target manifests. Re-run the experiments before
+using revised metrics as replacement table values.
 
 The reported prompt-design ablations use BrEaST as the source, UNet as the
 backbone, BUS-UCLM and BUSI as direct TTA targets, and the ordered
@@ -256,6 +288,8 @@ flex/
   training.py    Minimal segmentation-classification wrapper utilities
 tools/
   run_flex.py    Model-agnostic evaluation entry point
+  audit_results.py  Recompute metrics from saved predictions
+  summarize_runs.py  Three-run and cross-domain aggregation
 configs/
   flex.yaml      Default paper-aligned hyperparameters
 ```

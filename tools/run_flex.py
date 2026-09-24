@@ -5,14 +5,13 @@ import importlib
 import json
 from pathlib import Path
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from flex.data import UltrasoundCsvDataset
 from flex.method import FlexAdapter, FlexConfig, refine_mask
-from flex.metrics import macro_f1, segmentation_metrics
+from flex.metrics import segmentation_metrics, summarize_records
 
 
 def load_factory(spec: str):
@@ -29,14 +28,18 @@ def load_model(factory_spec: str, checkpoint: Path, image_size: int, device: tor
     return model.to(device)
 
 
-def evaluate(adapter: FlexAdapter, loader: DataLoader, device: torch.device, adapt: bool):
-    ious, dices, hd95s = [], [], []
-    lesion_ious, lesion_dices, empty_mismatches = [], [], []
-    y_true, y_pred = [], []
+def evaluate(adapter: FlexAdapter, loader: DataLoader, device: torch.device, mode: str):
+    if mode not in {"adapt", "source", "source_hierarchy", "fixed_frequency"}:
+        raise ValueError(f"Unknown evaluation mode: {mode}")
     records = []
     for images, masks, labels, paths in tqdm(loader, desc="eval", ncols=100):
         images = images.to(device)
-        outputs = adapter.predict(images, adapt=adapt)
+        outputs = adapter.predict(
+            images,
+            adapt=mode == "adapt",
+            fixed_frequency=mode == "fixed_frequency",
+            source_hierarchy=mode == "source_hierarchy",
+        )
         seg_probs = outputs["seg_probs"].detach().cpu().numpy()
         cls_probs = outputs["cls_probs"].detach().cpu().numpy()
         masks_np = masks.numpy()
@@ -44,18 +47,10 @@ def evaluate(adapter: FlexAdapter, loader: DataLoader, device: torch.device, ada
         preds = cls_probs.argmax(axis=1)
         pred_masks = seg_probs > adapter.cfg.mask_threshold
         for idx, path in enumerate(paths):
-            pred_mask = refine_mask(pred_masks[idx, 0], adapter.cfg)
+            pred_mask = pred_masks[idx, 0]
+            if mode != "source":
+                pred_mask = refine_mask(pred_mask, adapter.cfg)
             metrics = segmentation_metrics(pred_mask, masks_np[idx, 0] > 0.5)
-            ious.append(metrics["iou"])
-            dices.append(metrics["dice"])
-            if metrics["hd95"] is not None:
-                hd95s.append(metrics["hd95"])
-            if metrics["lesion_iou"] is not None:
-                lesion_ious.append(metrics["lesion_iou"])
-                lesion_dices.append(metrics["lesion_dice"])
-            empty_mismatches.append(metrics["empty_mismatch"])
-            y_true.append(int(labels_np[idx]))
-            y_pred.append(int(preds[idx]))
             records.append(
                 {
                     "image": str(path),
@@ -65,18 +60,7 @@ def evaluate(adapter: FlexAdapter, loader: DataLoader, device: torch.device, ada
                     **metrics,
                 }
             )
-    return {
-        "iou": float(np.mean(ious)) if ious else 0.0,
-        "dice": float(np.mean(dices)) if dices else 0.0,
-        "hd95": float(np.mean(hd95s)) if hd95s else None,
-        "lesion_iou": float(np.mean(lesion_ious)) if lesion_ious else None,
-        "lesion_dice": float(np.mean(lesion_dices)) if lesion_dices else None,
-        "empty_mismatch_rate": float(np.mean(empty_mismatches)) if empty_mismatches else 0.0,
-        "cls_acc": float(np.mean(np.asarray(y_true) == np.asarray(y_pred))) if y_true else 0.0,
-        "cls_f1": macro_f1(y_true, y_pred),
-        "n": len(y_true),
-        "records": records,
-    }
+    return {"mode": mode, **summarize_records(records), "records": records}
 
 
 def main() -> None:
@@ -107,21 +91,18 @@ def main() -> None:
     parser.add_argument("--lambda-pres", type=float, default=0.50)
     parser.add_argument("--lambda-neg", type=float, default=0.50)
     parser.add_argument("--beta-area", type=float, default=1.0)
-    parser.add_argument("--class-prior", default=None, help="Optional comma-separated Benign,Malignant,Normal prior.")
     parser.add_argument("--disable-morphology", action="store_true")
     parser.add_argument("--min-component-area-ratio", type=float, default=5e-4)
-    parser.add_argument("--no-adapt", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--no-adapt", action="store_true", help="Raw frozen source model baseline; no FLeX postprocessing.")
+    mode.add_argument("--source-hierarchy", action="store_true", help="Diagnostic control: frozen source with the FLeX lesion hierarchy.")
+    mode.add_argument("--fixed-frequency-only", action="store_true", help="Zero-prompt weighted-band control with the same FLeX fusion and refinement.")
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     dataset = UltrasoundCsvDataset(args.manifest, root=args.root, image_size=args.image_size)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
-    prior = None
-    if args.class_prior:
-        prior = tuple(float(item) for item in args.class_prior.split(","))
-        if len(prior) != 3:
-            raise ValueError("--class-prior must contain three comma-separated values")
     frequency_weights = tuple(float(item) for item in args.frequency_weights.split(","))
     if len(frequency_weights) != 3:
         raise ValueError("--frequency-weights must contain low,mid,high values")
@@ -145,13 +126,17 @@ def main() -> None:
         lambda_pres=args.lambda_pres,
         lambda_neg=args.lambda_neg,
         beta_area=args.beta_area,
-        class_prior=prior,
         morphology_refinement=not args.disable_morphology,
         min_component_area_ratio=args.min_component_area_ratio,
     )
     model = load_model(args.model_factory, Path(args.checkpoint), args.image_size, device)
     adapter = FlexAdapter(model, image_size=args.image_size, cfg=cfg).to(device)
-    result = evaluate(adapter, loader, device, adapt=not args.no_adapt)
+    evaluation_mode = (
+        "source" if args.no_adapt else
+        "source_hierarchy" if args.source_hierarchy else
+        "fixed_frequency" if args.fixed_frequency_only else "adapt"
+    )
+    result = evaluate(adapter, loader, device, mode=evaluation_mode)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w") as f:

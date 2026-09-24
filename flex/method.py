@@ -40,8 +40,6 @@ class FlexConfig:
     lambda_neg: float = 0.50
     beta_area: float = 1.0
     mask_threshold: float = 0.40
-    class_prior: tuple[float, float, float] | None = None
-    class_prior_strength: float = 1.0
     morphology_refinement: bool = True
     min_component_area_ratio: float = 5e-4
 
@@ -84,15 +82,6 @@ def lesion_first_probabilities(cls_logits: torch.Tensor, seg_logits: torch.Tenso
     probs[:, cfg.benign_index] = score * subtype_probs[:, 0]
     probs[:, cfg.malignant_index] = score * subtype_probs[:, 1]
     return probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-6)
-
-
-def class_prior_calibration(probs: torch.Tensor, cfg: FlexConfig) -> torch.Tensor:
-    if cfg.class_prior is None or cfg.class_prior_strength <= 0:
-        return probs
-    prior = probs.new_tensor(cfg.class_prior)
-    prior = prior / prior.sum().clamp_min(1e-8)
-    logits = probs.clamp_min(1e-8).log() + cfg.class_prior_strength * prior.clamp_min(1e-8).log()
-    return logits.softmax(dim=1)
 
 
 def source_supported_weight(source_seg_logits: torch.Tensor, source_cls_logits: torch.Tensor, cfg: FlexConfig) -> torch.Tensor:
@@ -242,7 +231,17 @@ class FlexAdapter:
                 parameter.zero_()
         self.optimizer = torch.optim.Adam(self.prompt.parameters(), lr=self.cfg.lr)
 
-    def predict(self, images: torch.Tensor, adapt: bool = True) -> dict[str, torch.Tensor]:
+    def predict(
+        self,
+        images: torch.Tensor,
+        adapt: bool = True,
+        fixed_frequency: bool = False,
+        source_hierarchy: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        if adapt and (fixed_frequency or source_hierarchy):
+            raise ValueError("Choose only one prediction mode")
+        if fixed_frequency and source_hierarchy:
+            raise ValueError("Choose only one prediction mode")
         self.model.eval()
         self.source_model.eval()
         with torch.no_grad():
@@ -251,8 +250,31 @@ class FlexAdapter:
             outputs = self.adapt(images)
             adapted_seg_logits = outputs["adapted_seg_logits"]
             adapted_cls_logits = outputs["adapted_cls_logits"]
+        elif fixed_frequency:
+            # The zero-prompt control keeps the weighted frequency image but
+            # performs no parameter or optimizer update.
+            with torch.no_grad():
+                weighted_image = apply_frequency_prompt(
+                    images, self.prompt, self.cfg.frequency_weights,
+                    self.cfg.prompt_mode, zero_prompt=True,
+                )
+                adapted_seg_logits, adapted_cls_logits = self.model(weighted_image)
         else:
             adapted_seg_logits, adapted_cls_logits = source_seg_logits, source_cls_logits
+
+        if not (adapt or fixed_frequency or source_hierarchy):
+            # Paper No Adapt is a frozen source forward pass, without FLeX's
+            # lesion hierarchy, fusion, or morphology.
+            with torch.no_grad():
+                source_prob = torch.sigmoid(source_seg_logits)
+                raw_class_prob = source_cls_logits.softmax(dim=1)
+            return {
+                "seg_probs": source_prob,
+                "cls_probs": raw_class_prob,
+                "source_seg_probs": source_prob,
+                "adapted_seg_probs": source_prob,
+                "reliability": torch.zeros(images.shape[0], device=images.device),
+            }
 
         with torch.no_grad():
             p0 = torch.sigmoid(source_seg_logits)
@@ -271,7 +293,6 @@ class FlexAdapter:
                 p_final = pt
                 cls_probs = pt_cls
             cls_probs = cls_probs / cls_probs.sum(dim=1, keepdim=True).clamp_min(1e-6)
-            cls_probs = class_prior_calibration(cls_probs, self.cfg)
         return {
             "seg_probs": p_final,
             "cls_probs": cls_probs,

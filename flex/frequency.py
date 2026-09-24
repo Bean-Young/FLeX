@@ -99,12 +99,15 @@ def apply_frequency_prompt(
     prompt: FrequencyPrompt,
     weights: torch.Tensor | tuple[float, float, float] | None = None,
     mode: str = "bands",
+    zero_prompt: bool = False,
 ) -> torch.Tensor:
-    """Build the lesion-frequency representation in Eq. (11)."""
+    """Build the paper representation, or its fixed-weight zero-prompt control."""
 
     batch, _channels, height, width = images.shape
     if mode == "full":
         # Full-band ablation: one prompt acts on the undecomposed image.
+        if zero_prompt:
+            return images
         residual = _resize(prompt.low, height, width)
         return images + prompt.xi * torch.tanh(residual)
     if mode != "bands":
@@ -120,14 +123,9 @@ def apply_frequency_prompt(
 
     masks = prompt.masks(height, width, images.device)
     bands = decompose_frequency_bands(images, prompt)
-    params = (
-        _resize(prompt.low, height, width),
-        _resize(prompt.mid, height, width),
-        _resize(prompt.high, height, width),
-    )
+    params = (prompt.low, prompt.mid, prompt.high)
     output = torch.zeros_like(images)
     for band_idx, (band, param, mask) in enumerate(zip(bands, params, masks)):
-        residual = _band_limited_residual(param, mask, height, width)
-        prompted = band + prompt.xi * residual
+        prompted = band if zero_prompt else band + prompt.xi * _band_limited_residual(param, mask, height, width)
         output = output + weights[:, band_idx].view(batch, 1, 1, 1) * prompted
     return output

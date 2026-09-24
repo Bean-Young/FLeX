@@ -39,8 +39,6 @@ loss:
   beta_area: 1.0
 
 output_safeguards:
-  class_prior: null
-  class_prior_strength: 1.0
   morphology_refinement: true
   min_component_area_ratio: 0.0005
 
@@ -50,6 +48,7 @@ reported_ablation_protocol:
   tta_targets: [BUS-UCLM, BUSI]
   ctta_stream: [BUSBRA_D1, BUSBRA_D2, BUSBRA_D3, BUSBRA_D4]
   prompt_designs:
+    zero_prompt_weighted_bands: {prompt_mode: bands, frequency_weights: [0.25, 0.50, 0.25], fixed_frequency_only: true}
     full_band: {prompt_mode: full}
     low_only: {prompt_mode: bands, frequency_weights: [1.0, 0.0, 0.0]}
     mid_only: {prompt_mode: bands, frequency_weights: [0.0, 1.0, 0.0]}
